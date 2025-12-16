@@ -10,6 +10,11 @@ import {
   sendCustomerConfirmationEmail,
   sendRestaurantNotificationEmail,
 } from "@/lib/email";
+import {
+  validateLockForReservation,
+  getLockById,
+  releaseLock,
+} from "@/lib/slotLock";
 
 // Schéma de validation Zod
 const reservationSchema = z.object({
@@ -40,6 +45,9 @@ const reservationSchema = z.object({
   occasion: z.string().max(100).optional(),
   specialRequests: z.string().max(500).optional(),
   allergies: z.string().max(500).optional(),
+  // Champs pour le système de verrouillage
+  lockId: z.string().optional(),
+  sessionId: z.string().optional(),
 });
 
 // Générer une référence unique au format R2024-000001
@@ -133,6 +141,8 @@ export async function POST(request: NextRequest) {
       occasion,
       specialRequests,
       allergies,
+      lockId,
+      sessionId,
     } = validationResult.data;
 
     // Récupérer le restaurant
@@ -144,51 +154,87 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 2. Double vérification de disponibilité
     const reservationDate = new Date(date + "T00:00:00");
-    const availability = await getAvailability(reservationDate, partySize);
+    let tableId: string | null = null;
 
-    // Vérifier si le créneau demandé est disponible
-    const requestedSlot = availability.slots.find((s) => s.time === time);
-    if (!requestedSlot || !requestedSlot.available) {
-      // 3. Retourner erreur 409 avec créneaux alternatifs
-      const alternativeSlots = availability.slots
-        .filter((s) => s.available)
-        .slice(0, 5)
-        .map((s) => s.time);
-
-      return NextResponse.json(
-        {
-          error: "Ce créneau n'est plus disponible",
-          code: "SLOT_UNAVAILABLE",
-          alternatives: alternativeSlots,
-          message:
-            alternativeSlots.length > 0
-              ? `Le créneau de ${time} n'est plus disponible. Créneaux alternatifs : ${alternativeSlots.join(", ")}`
-              : `Aucun créneau disponible pour ${partySize} personnes le ${date}`,
-        },
-        { status: 409 }
+    // 2. Vérifier le verrou si fourni
+    if (lockId && sessionId) {
+      const lockValidation = validateLockForReservation(
+        lockId,
+        sessionId,
+        date,
+        time
       );
+
+      if (!lockValidation.valid) {
+        // Le verrou n'est plus valide, récupérer les alternatives
+        const availability = await getAvailability(reservationDate, partySize);
+        const alternativeSlots = availability.slots
+          .filter((s) => s.available)
+          .slice(0, 5)
+          .map((s) => s.time);
+
+        return NextResponse.json(
+          {
+            error: lockValidation.error || "Verrou invalide",
+            code: "LOCK_INVALID",
+            alternatives: alternativeSlots,
+          },
+          { status: 409 }
+        );
+      }
+
+      // Utiliser la table du verrou
+      const lock = getLockById(lockId);
+      if (lock) {
+        tableId = lock.tableId;
+      }
     }
 
-    // 4. Trouver une table disponible
-    const tableId = await findAvailableTable(reservationDate, time, partySize);
-
+    // 3. Si pas de verrou ou pas de table, vérifier disponibilité classique
     if (!tableId) {
-      // Aucune table disponible (cas rare après la vérification ci-dessus)
-      const alternativeSlots = availability.slots
-        .filter((s) => s.available && s.time !== time)
-        .slice(0, 5)
-        .map((s) => s.time);
+      const availability = await getAvailability(reservationDate, partySize);
 
-      return NextResponse.json(
-        {
-          error: "Aucune table disponible pour ce créneau",
-          code: "NO_TABLE_AVAILABLE",
-          alternatives: alternativeSlots,
-        },
-        { status: 409 }
-      );
+      // Vérifier si le créneau demandé est disponible
+      const requestedSlot = availability.slots.find((s) => s.time === time);
+      if (!requestedSlot || !requestedSlot.available) {
+        const alternativeSlots = availability.slots
+          .filter((s) => s.available)
+          .slice(0, 5)
+          .map((s) => s.time);
+
+        return NextResponse.json(
+          {
+            error: "Ce créneau n'est plus disponible",
+            code: "SLOT_UNAVAILABLE",
+            alternatives: alternativeSlots,
+            message:
+              alternativeSlots.length > 0
+                ? `Le créneau de ${time} n'est plus disponible. Créneaux alternatifs : ${alternativeSlots.join(", ")}`
+                : `Aucun créneau disponible pour ${partySize} personnes le ${date}`,
+          },
+          { status: 409 }
+        );
+      }
+
+      // 4. Trouver une table disponible
+      tableId = await findAvailableTable(reservationDate, time, partySize);
+
+      if (!tableId) {
+        const alternativeSlots = availability.slots
+          .filter((s) => s.available && s.time !== time)
+          .slice(0, 5)
+          .map((s) => s.time);
+
+        return NextResponse.json(
+          {
+            error: "Aucune table disponible pour ce créneau",
+            code: "NO_TABLE_AVAILABLE",
+            alternatives: alternativeSlots,
+          },
+          { status: 409 }
+        );
+      }
     }
 
     // 5. Créer ou récupérer le client (par email)
@@ -270,7 +316,12 @@ export async function POST(request: NextRequest) {
       specialRequests,
     };
 
-    // 8. Envoyer email de confirmation au client
+    // 8. Libérer le verrou après création réussie
+    if (lockId) {
+      releaseLock(lockId);
+    }
+
+    // 9. Envoyer email de confirmation au client
     const customerEmailResult = await sendCustomerConfirmationEmail(emailData);
     if (!customerEmailResult.success) {
       console.warn(
@@ -279,7 +330,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 9. Envoyer email de notification au restaurant
+    // 10. Envoyer email de notification au restaurant
     const restaurantEmailResult =
       await sendRestaurantNotificationEmail(emailData);
     if (!restaurantEmailResult.success) {
@@ -289,7 +340,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 10. Retourner la réservation créée avec sa référence
+    // 11. Retourner la réservation créée avec sa référence
     return NextResponse.json(
       {
         success: true,

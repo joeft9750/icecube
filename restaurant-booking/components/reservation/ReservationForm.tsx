@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -17,6 +17,8 @@ import {
   ArrowLeft,
   ArrowRight,
   Phone,
+  Timer,
+  AlertCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
@@ -39,8 +41,20 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { useToast } from "@/components/ui/use-toast";
 import { cn } from "@/lib/utils";
+
+// Générer un ID de session unique
+function generateSessionId(): string {
+  return `session_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
+}
 
 // Schéma de validation Zod
 const reservationSchema = z.object({
@@ -80,6 +94,12 @@ interface TimeSlot {
   available: boolean;
 }
 
+interface LockInfo {
+  lockId: string;
+  tableId: string;
+  expiresAt: string;
+}
+
 const STEPS = [
   { id: 1, title: "Date", icon: CalendarIcon },
   { id: 2, title: "Personnes", icon: Users },
@@ -105,6 +125,16 @@ export function ReservationForm() {
   const [reservationRef, setReservationRef] = useState("");
   const [isSuccess, setIsSuccess] = useState(false);
 
+  // États pour le système de verrou
+  const [sessionId] = useState(() => generateSessionId());
+  const [lockInfo, setLockInfo] = useState<LockInfo | null>(null);
+  const [remainingTime, setRemainingTime] = useState<number>(0);
+  const [isLocking, setIsLocking] = useState(false);
+  const [showAlternativesDialog, setShowAlternativesDialog] = useState(false);
+  const [alternatives, setAlternatives] = useState<string[]>([]);
+  const [lockExpiredMessage, setLockExpiredMessage] = useState("");
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+
   const form = useForm<ReservationFormData>({
     resolver: zodResolver(reservationSchema),
     defaultValues: {
@@ -126,10 +156,81 @@ export function ReservationForm() {
   const watchPartySize = watch("partySize");
   const watchTime = watch("time");
 
+  // Nettoyer le timer au démontage
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+      }
+    };
+  }, []);
+
+  // Gérer le countdown du verrou
+  useEffect(() => {
+    if (lockInfo && remainingTime > 0) {
+      timerRef.current = setInterval(() => {
+        setRemainingTime((prev) => {
+          if (prev <= 1) {
+            // Le verrou a expiré
+            if (timerRef.current) {
+              clearInterval(timerRef.current);
+            }
+            handleLockExpired();
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+
+      return () => {
+        if (timerRef.current) {
+          clearInterval(timerRef.current);
+        }
+      };
+    }
+  }, [lockInfo]);
+
+  // Gérer l'expiration du verrou
+  const handleLockExpired = useCallback(() => {
+    setLockInfo(null);
+    setLockExpiredMessage("Votre réservation temporaire a expiré. Veuillez sélectionner à nouveau un créneau.");
+    setValue("time", "");
+    setCurrentStep(3);
+
+    toast({
+      title: "Temps écoulé",
+      description: "Votre créneau a été libéré. Veuillez sélectionner à nouveau.",
+      variant: "destructive",
+    });
+  }, [setValue, toast]);
+
+  // Libérer le verrou
+  const releaseLock = useCallback(async () => {
+    if (lockInfo) {
+      try {
+        await fetch(`/api/availability/lock/${lockInfo.lockId}`, {
+          method: "DELETE",
+          headers: { "x-session-id": sessionId },
+        });
+      } catch (error) {
+        console.error("Erreur libération verrou:", error);
+      }
+      setLockInfo(null);
+      setRemainingTime(0);
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+      }
+    }
+  }, [lockInfo, sessionId]);
+
   // Charger les créneaux quand date et partySize changent
   useEffect(() => {
     if (watchDate && watchPartySize && currentStep === 3) {
       loadAvailability();
+      // Libérer l'ancien verrou si on revient à l'étape 3
+      if (lockInfo) {
+        releaseLock();
+      }
     }
   }, [watchDate, watchPartySize, currentStep]);
 
@@ -138,6 +239,7 @@ export function ReservationForm() {
 
     setIsLoadingSlots(true);
     setValue("time", "");
+    setLockExpiredMessage("");
 
     try {
       const dateStr = format(watchDate, "yyyy-MM-dd");
@@ -168,6 +270,73 @@ export function ReservationForm() {
     }
   };
 
+  // Verrouiller un créneau
+  const lockSlot = async (time: string) => {
+    if (!watchDate || !watchPartySize) return;
+
+    setIsLocking(true);
+    setLockExpiredMessage("");
+
+    try {
+      const dateStr = format(watchDate, "yyyy-MM-dd");
+      const response = await fetch("/api/availability/lock", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          date: dateStr,
+          time,
+          partySize: watchPartySize,
+          sessionId,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (data.success) {
+        // Verrou créé avec succès
+        setLockInfo({
+          lockId: data.lockId,
+          tableId: data.tableId,
+          expiresAt: data.expiresAt,
+        });
+        setRemainingTime(data.expiresInSeconds);
+        setValue("time", time);
+
+        toast({
+          title: "Créneau réservé",
+          description: `Vous avez 5 minutes pour finaliser votre réservation.`,
+        });
+      } else {
+        // Créneau non disponible, montrer les alternatives
+        setAlternatives(data.alternatives || []);
+        setShowAlternativesDialog(true);
+        setValue("time", "");
+      }
+    } catch (error) {
+      console.error("Erreur verrouillage:", error);
+      toast({
+        title: "Erreur",
+        description: "Impossible de réserver ce créneau. Veuillez réessayer.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsLocking(false);
+    }
+  };
+
+  // Sélectionner un créneau alternatif
+  const selectAlternative = async (time: string) => {
+    setShowAlternativesDialog(false);
+    await lockSlot(time);
+  };
+
+  // Formater le temps restant
+  const formatRemainingTime = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, "0")}`;
+  };
+
   // Désactiver les lundis et dates passées
   const disabledDays = [
     { before: new Date() },
@@ -181,7 +350,7 @@ export function ReservationForm() {
       case 2:
         return !!watchPartySize;
       case 3:
-        return !!watchTime;
+        return !!watchTime && !!lockInfo;
       case 4:
         return !errors.firstName && !errors.lastName && !errors.email && !errors.phone && !errors.rgpdConsent;
       default:
@@ -201,6 +370,15 @@ export function ReservationForm() {
         break;
       case 3:
         isValid = await trigger("time");
+        // Vérifier aussi que le verrou est actif
+        if (isValid && !lockInfo) {
+          toast({
+            title: "Créneau non verrouillé",
+            description: "Veuillez cliquer sur un créneau pour le réserver.",
+            variant: "destructive",
+          });
+          return;
+        }
         break;
       case 4:
         isValid = await trigger(["firstName", "lastName", "email", "phone", "rgpdConsent"]);
@@ -215,10 +393,23 @@ export function ReservationForm() {
   };
 
   const handleBack = () => {
+    // Si on revient de l'étape 4 ou 5, on garde le verrou
+    // Si on revient à l'étape 3, on libère le verrou (via useEffect)
     setCurrentStep((prev) => Math.max(prev - 1, 1));
   };
 
   const onSubmit = async (data: ReservationFormData) => {
+    // Vérifier que le verrou est toujours valide
+    if (!lockInfo) {
+      toast({
+        title: "Erreur",
+        description: "Votre réservation temporaire a expiré. Veuillez recommencer.",
+        variant: "destructive",
+      });
+      setCurrentStep(3);
+      return;
+    }
+
     setIsSubmitting(true);
 
     try {
@@ -228,16 +419,33 @@ export function ReservationForm() {
         body: JSON.stringify({
           ...data,
           date: format(data.date, "yyyy-MM-dd"),
+          lockId: lockInfo.lockId,
+          sessionId,
         }),
       });
 
       const result = await response.json();
 
       if (!response.ok) {
+        // Si le créneau n'est plus disponible
+        if (result.code === "SLOT_UNAVAILABLE" || result.code === "LOCK_INVALID") {
+          setAlternatives(result.alternatives || []);
+          setShowAlternativesDialog(true);
+          setLockInfo(null);
+          setValue("time", "");
+          setCurrentStep(3);
+          return;
+        }
         throw new Error(result.error || "Erreur lors de la réservation");
       }
 
-      setReservationRef(result.reference);
+      // Succès - nettoyer le verrou et afficher la confirmation
+      setLockInfo(null);
+      setRemainingTime(0);
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+      }
+      setReservationRef(result.reservation.reference);
       setIsSuccess(true);
     } catch (error) {
       toast({
@@ -296,8 +504,8 @@ export function ReservationForm() {
             <p className="text-sm text-muted-foreground">
               Un email de confirmation a été envoyé à {form.getValues("email")}
             </p>
-            <Button onClick={() => router.push("/")} className="w-full">
-              Retour à l&apos;accueil
+            <Button onClick={() => router.push(`/reservation/confirmation/${reservationRef}`)} className="w-full">
+              Voir ma réservation
             </Button>
           </div>
         </CardContent>
@@ -358,6 +566,19 @@ export function ReservationForm() {
         })}
       </div>
 
+      {/* Timer Badge - Visible quand un verrou est actif */}
+      {lockInfo && remainingTime > 0 && currentStep >= 3 && (
+        <div className="flex justify-center">
+          <Badge
+            variant={remainingTime < 60 ? "destructive" : "secondary"}
+            className="text-lg px-4 py-2 animate-pulse"
+          >
+            <Timer className="h-4 w-4 mr-2" />
+            Créneau réservé : {formatRemainingTime(remainingTime)}
+          </Badge>
+        </div>
+      )}
+
       {/* Form Card */}
       <Card>
         <CardHeader>
@@ -371,7 +592,7 @@ export function ReservationForm() {
           <CardDescription>
             {currentStep === 1 && "Le restaurant est fermé le lundi"}
             {currentStep === 2 && "Pour les groupes de plus de 8 personnes, contactez-nous"}
-            {currentStep === 3 && "Choisissez l'heure de votre réservation"}
+            {currentStep === 3 && "Cliquez sur un créneau pour le réserver temporairement"}
             {currentStep === 4 && "Renseignez vos informations de contact"}
             {currentStep === 5 && "Vérifiez les informations avant de confirmer"}
           </CardDescription>
@@ -427,6 +648,14 @@ export function ReservationForm() {
             {/* ÉTAPE 3: Créneau horaire */}
             {currentStep === 3 && (
               <div className="space-y-4">
+                {/* Message si le verrou a expiré */}
+                {lockExpiredMessage && (
+                  <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-start gap-3">
+                    <AlertCircle className="h-5 w-5 text-amber-600 mt-0.5 flex-shrink-0" />
+                    <p className="text-amber-800 text-sm">{lockExpiredMessage}</p>
+                  </div>
+                )}
+
                 {isLoadingSlots ? (
                   <div className="flex items-center justify-center py-12">
                     <Loader2 className="h-8 w-8 animate-spin text-primary" />
@@ -459,15 +688,19 @@ export function ReservationForm() {
                                 key={slot.time}
                                 type="button"
                                 variant={watchTime === slot.time ? "default" : "outline"}
-                                disabled={!slot.available}
+                                disabled={!slot.available || isLocking}
                                 className={cn(
                                   "h-12",
                                   !slot.available && "opacity-50 cursor-not-allowed",
                                   slot.available && watchTime !== slot.time && "hover:border-primary"
                                 )}
-                                onClick={() => slot.available && setValue("time", slot.time)}
+                                onClick={() => slot.available && lockSlot(slot.time)}
                               >
-                                <span>{slot.time}</span>
+                                {isLocking && watchTime !== slot.time ? (
+                                  <span>{slot.time}</span>
+                                ) : (
+                                  <span>{slot.time}</span>
+                                )}
                                 {!slot.available && (
                                   <Badge variant="secondary" className="ml-2 text-xs">
                                     Complet
@@ -491,13 +724,13 @@ export function ReservationForm() {
                                 key={slot.time}
                                 type="button"
                                 variant={watchTime === slot.time ? "default" : "outline"}
-                                disabled={!slot.available}
+                                disabled={!slot.available || isLocking}
                                 className={cn(
                                   "h-12",
                                   !slot.available && "opacity-50 cursor-not-allowed",
                                   slot.available && watchTime !== slot.time && "hover:border-primary"
                                 )}
-                                onClick={() => slot.available && setValue("time", slot.time)}
+                                onClick={() => slot.available && lockSlot(slot.time)}
                               >
                                 <span>{slot.time}</span>
                                 {!slot.available && (
@@ -508,6 +741,31 @@ export function ReservationForm() {
                               </Button>
                             ))}
                         </div>
+                      </div>
+                    )}
+
+                    {/* Indicateur de verrouillage */}
+                    {isLocking && (
+                      <div className="flex items-center justify-center py-4">
+                        <Loader2 className="h-5 w-5 animate-spin text-primary mr-2" />
+                        <span className="text-sm text-muted-foreground">
+                          Réservation du créneau en cours...
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Info sur le verrou actif */}
+                    {lockInfo && watchTime && (
+                      <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+                        <div className="flex items-center gap-2 text-green-800">
+                          <CheckCircle className="h-5 w-5" />
+                          <span className="font-medium">
+                            Créneau de {watchTime} réservé temporairement
+                          </span>
+                        </div>
+                        <p className="text-green-700 text-sm mt-1">
+                          Vous avez {formatRemainingTime(remainingTime)} pour finaliser votre réservation.
+                        </p>
                       </div>
                     )}
                   </>
@@ -675,6 +933,15 @@ export function ReservationForm() {
                   )}
                 </div>
 
+                {/* Avertissement sur le temps restant */}
+                {lockInfo && remainingTime > 0 && remainingTime < 120 && (
+                  <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+                    <p className="text-amber-800 text-sm">
+                      <strong>Attention :</strong> Il vous reste {formatRemainingTime(remainingTime)} pour confirmer votre réservation.
+                    </p>
+                  </div>
+                )}
+
                 <p className="text-sm text-muted-foreground text-center">
                   En confirmant, vous acceptez nos conditions générales et notre politique de confidentialité.
                 </p>
@@ -697,7 +964,7 @@ export function ReservationForm() {
                 <Button
                   type="button"
                   onClick={handleNext}
-                  disabled={!canGoNext()}
+                  disabled={!canGoNext() || isLocking}
                 >
                   Suivant
                   <ArrowRight className="h-4 w-4 ml-2" />
@@ -705,7 +972,7 @@ export function ReservationForm() {
               ) : (
                 <Button
                   type="submit"
-                  disabled={isSubmitting}
+                  disabled={isSubmitting || !lockInfo}
                   className="min-w-[200px]"
                 >
                   {isSubmitting ? (
@@ -725,6 +992,60 @@ export function ReservationForm() {
           </form>
         </CardContent>
       </Card>
+
+      {/* Dialog des créneaux alternatifs */}
+      <Dialog open={showAlternativesDialog} onOpenChange={setShowAlternativesDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <AlertCircle className="h-5 w-5 text-amber-500" />
+              Créneau non disponible
+            </DialogTitle>
+            <DialogDescription>
+              Ce créneau vient d&apos;être réservé par un autre utilisateur.
+              {alternatives.length > 0
+                ? " Voici des créneaux alternatifs :"
+                : " Aucun créneau alternatif disponible pour cette date."}
+            </DialogDescription>
+          </DialogHeader>
+
+          {alternatives.length > 0 ? (
+            <div className="grid grid-cols-3 gap-2 mt-4">
+              {alternatives.map((time) => (
+                <Button
+                  key={time}
+                  variant="outline"
+                  onClick={() => selectAlternative(time)}
+                  className="h-12"
+                >
+                  {time}
+                </Button>
+              ))}
+            </div>
+          ) : (
+            <div className="flex justify-center mt-4">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setShowAlternativesDialog(false);
+                  setCurrentStep(1);
+                }}
+              >
+                Choisir une autre date
+              </Button>
+            </div>
+          )}
+
+          <div className="flex justify-end mt-4">
+            <Button
+              variant="ghost"
+              onClick={() => setShowAlternativesDialog(false)}
+            >
+              Fermer
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
