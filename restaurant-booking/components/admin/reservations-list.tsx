@@ -21,24 +21,45 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useToast } from "@/components/ui/use-toast";
+import { Loader2 } from "lucide-react";
+
+interface Customer {
+  id: string;
+  email: string;
+  phone: string | null;
+  firstName: string;
+  lastName: string;
+  allergies: string | null;
+}
+
+interface TableInfo {
+  id: string;
+  name: string;
+  maxCapacity: number;
+  zone: string | null;
+}
 
 interface Reservation {
   id: string;
-  name: string;
-  email: string;
-  phone: string;
+  reference: string;
   date: string;
-  time: string;
-  guests: number;
-  notes: string | null;
-  status: "PENDING" | "CONFIRMED" | "CANCELLED";
+  timeStart: string;
+  timeEnd: string;
+  partySize: number;
+  status: "PENDING" | "CONFIRMED" | "CANCELLED" | "NO_SHOW" | "COMPLETED";
+  occasion: string | null;
+  specialRequests: string | null;
   createdAt: string;
+  customer: Customer;
+  table: TableInfo | null;
 }
 
-const statusLabels = {
-  PENDING: { label: "En attente", variant: "warning" as const },
-  CONFIRMED: { label: "Confirmée", variant: "success" as const },
-  CANCELLED: { label: "Annulée", variant: "destructive" as const },
+const statusConfig = {
+  PENDING: { label: "En attente", variant: "warning" as const, color: "bg-yellow-100 text-yellow-800" },
+  CONFIRMED: { label: "Confirmée", variant: "success" as const, color: "bg-green-100 text-green-800" },
+  CANCELLED: { label: "Annulée", variant: "destructive" as const, color: "bg-red-100 text-red-800" },
+  NO_SHOW: { label: "No-show", variant: "destructive" as const, color: "bg-gray-100 text-gray-800" },
+  COMPLETED: { label: "Terminée", variant: "secondary" as const, color: "bg-blue-100 text-blue-800" },
 };
 
 export function ReservationsList() {
@@ -120,8 +141,8 @@ export function ReservationsList() {
 
   if (isLoading) {
     return (
-      <div className="text-center py-8 text-muted-foreground">
-        Chargement des réservations...
+      <div className="flex items-center justify-center py-8">
+        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
       </div>
     );
   }
@@ -141,8 +162,10 @@ export function ReservationsList() {
     <Table>
       <TableHeader>
         <TableRow>
+          <TableHead>Référence</TableHead>
           <TableHead>Client</TableHead>
           <TableHead>Date & Heure</TableHead>
+          <TableHead>Table</TableHead>
           <TableHead>Convives</TableHead>
           <TableHead>Statut</TableHead>
           <TableHead>Actions</TableHead>
@@ -152,30 +175,59 @@ export function ReservationsList() {
         {reservations.map((reservation) => (
           <TableRow key={reservation.id}>
             <TableCell>
+              <span className="font-mono text-sm">{reservation.reference}</span>
+            </TableCell>
+            <TableCell>
               <div>
-                <p className="font-medium">{reservation.name}</p>
-                <p className="text-sm text-muted-foreground">
-                  {reservation.email}
+                <p className="font-medium">
+                  {reservation.customer.firstName} {reservation.customer.lastName}
                 </p>
                 <p className="text-sm text-muted-foreground">
-                  {reservation.phone}
+                  {reservation.customer.email}
                 </p>
+                {reservation.customer.phone && (
+                  <p className="text-sm text-muted-foreground">
+                    {reservation.customer.phone}
+                  </p>
+                )}
+                {reservation.customer.allergies && (
+                  <Badge variant="outline" className="mt-1 text-xs">
+                    Allergies: {reservation.customer.allergies}
+                  </Badge>
+                )}
               </div>
             </TableCell>
             <TableCell>
               <div>
                 <p className="font-medium">
-                  {format(new Date(reservation.date), "d MMM yyyy", {
+                  {format(new Date(reservation.date), "EEE d MMM", {
                     locale: fr,
                   })}
                 </p>
                 <p className="text-sm text-muted-foreground">
-                  {reservation.time}
+                  {reservation.timeStart} - {reservation.timeEnd}
                 </p>
+                {reservation.occasion && (
+                  <Badge variant="secondary" className="mt-1 text-xs">
+                    {reservation.occasion}
+                  </Badge>
+                )}
               </div>
             </TableCell>
             <TableCell>
-              <Badge variant="outline">{reservation.guests} pers.</Badge>
+              {reservation.table ? (
+                <div>
+                  <p className="font-medium">{reservation.table.name}</p>
+                  <p className="text-sm text-muted-foreground">
+                    {reservation.table.zone}
+                  </p>
+                </div>
+              ) : (
+                <span className="text-muted-foreground">Non assignée</span>
+              )}
+            </TableCell>
+            <TableCell>
+              <Badge variant="outline">{reservation.partySize} pers.</Badge>
             </TableCell>
             <TableCell>
               <Select
@@ -184,8 +236,10 @@ export function ReservationsList() {
               >
                 <SelectTrigger className="w-32">
                   <SelectValue>
-                    <Badge variant={statusLabels[reservation.status].variant}>
-                      {statusLabels[reservation.status].label}
+                    <Badge
+                      className={statusConfig[reservation.status].color}
+                    >
+                      {statusConfig[reservation.status].label}
                     </Badge>
                   </SelectValue>
                 </SelectTrigger>
@@ -193,18 +247,22 @@ export function ReservationsList() {
                   <SelectItem value="PENDING">En attente</SelectItem>
                   <SelectItem value="CONFIRMED">Confirmée</SelectItem>
                   <SelectItem value="CANCELLED">Annulée</SelectItem>
+                  <SelectItem value="NO_SHOW">No-show</SelectItem>
+                  <SelectItem value="COMPLETED">Terminée</SelectItem>
                 </SelectContent>
               </Select>
             </TableCell>
             <TableCell>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="text-destructive"
-                onClick={() => deleteReservation(reservation.id)}
-              >
-                Supprimer
-              </Button>
+              <div className="flex gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-destructive hover:text-destructive"
+                  onClick={() => deleteReservation(reservation.id)}
+                >
+                  Supprimer
+                </Button>
+              </div>
             </TableCell>
           </TableRow>
         ))}

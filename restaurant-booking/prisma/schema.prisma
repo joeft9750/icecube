@@ -7,35 +7,124 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model Reservation {
+// Restaurant principal
+model Restaurant {
+  id            String   @id @default(cuid())
+  name          String
+  address       String
+  phone         String
+  email         String
+  openingHours  Json     // { "monday": null, "tuesday": { "lunch": ["12:00", "14:30"], "dinner": ["19:00", "22:30"] }, ... }
+  bookingConfig Json     // { "slotDuration": 30, "mealDuration": 90, "bufferTime": 15 }
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  tables        Table[]
+  reservations  Reservation[]
+  blockedSlots  BlockedSlot[]
+
+  @@map("restaurants")
+}
+
+// Tables du restaurant
+model Table {
+  id           String   @id @default(cuid())
+  restaurantId String
+  name         String   // "Table 1", "Terrasse A", etc.
+  minCapacity  Int      @default(1)
+  maxCapacity  Int
+  zone         String?  // "Salle principale", "Terrasse", "Salon privé"
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  restaurant   Restaurant    @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  reservations Reservation[]
+  blockedSlots BlockedSlot[]
+
+  @@index([restaurantId])
+  @@index([isActive])
+  @@map("tables")
+}
+
+// Clients
+model Customer {
   id          String   @id @default(cuid())
-  name        String
-  email       String
-  phone       String
-  date        DateTime
-  time        String
-  guests      Int
+  email       String   @unique
+  phone       String?
+  firstName   String
+  lastName    String
+  allergies   String?
   notes       String?
-  status      ReservationStatus @default(PENDING)
+  visitCount  Int      @default(0)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+
+  reservations Reservation[]
+
+  @@index([email])
+  @@index([phone])
+  @@map("customers")
+}
+
+// Réservations
+model Reservation {
+  id              String            @id @default(cuid())
+  reference       String            @unique // Format "R2024-000001"
+  restaurantId    String
+  tableId         String?
+  customerId      String
+  date            DateTime          @db.Date
+  timeStart       String            // "19:30"
+  timeEnd         String            // "21:00"
+  partySize       Int
+  status          ReservationStatus @default(PENDING)
+  occasion        String?           // "Anniversaire", "Affaires", etc.
+  specialRequests String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  confirmedAt     DateTime?
+
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  table      Table?     @relation(fields: [tableId], references: [id], onDelete: SetNull)
+  customer   Customer   @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([restaurantId])
+  @@index([tableId])
+  @@index([customerId])
+  @@index([date])
+  @@index([status])
+  @@index([reference])
+  @@index([restaurantId, date])
+  @@map("reservations")
 }
 
 enum ReservationStatus {
   PENDING
   CONFIRMED
   CANCELLED
+  NO_SHOW
+  COMPLETED
 }
 
-model TimeSlot {
-  id          String   @id @default(cuid())
-  time        String
-  maxGuests   Int      @default(20)
-  isActive    Boolean  @default(true)
-}
+// Créneaux bloqués manuellement
+model BlockedSlot {
+  id           String   @id @default(cuid())
+  restaurantId String
+  tableId      String?  // Si null, bloque tout le restaurant
+  date         DateTime @db.Date
+  timeStart    String
+  timeEnd      String
+  reason       String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
-model ClosedDate {
-  id          String   @id @default(cuid())
-  date        DateTime
-  reason      String?
+  restaurant Restaurant @relation(fields: [restaurantId], references: [id], onDelete: Cascade)
+  table      Table?     @relation(fields: [tableId], references: [id], onDelete: Cascade)
+
+  @@index([restaurantId])
+  @@index([tableId])
+  @@index([date])
+  @@index([restaurantId, date])
+  @@map("blocked_slots")
 }

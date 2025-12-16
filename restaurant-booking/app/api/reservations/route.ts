@@ -2,13 +2,72 @@ import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { resend } from "@/lib/resend";
 
-export async function GET() {
+// Générer une référence unique
+async function generateReference(): Promise<string> {
+  const year = new Date().getFullYear();
+  const lastReservation = await prisma.reservation.findFirst({
+    where: {
+      reference: {
+        startsWith: `R${year}-`,
+      },
+    },
+    orderBy: {
+      reference: "desc",
+    },
+  });
+
+  let nextNumber = 1;
+  if (lastReservation) {
+    const lastNumber = parseInt(lastReservation.reference.split("-")[1]);
+    nextNumber = lastNumber + 1;
+  }
+
+  return `R${year}-${nextNumber.toString().padStart(6, "0")}`;
+}
+
+// Calculer l'heure de fin basée sur la durée du repas
+function calculateEndTime(startTime: string, durationMinutes: number): string {
+  const [hours, minutes] = startTime.split(":").map(Number);
+  const totalMinutes = hours * 60 + minutes + durationMinutes;
+  const endHours = Math.floor(totalMinutes / 60);
+  const endMinutes = totalMinutes % 60;
+  return `${endHours.toString().padStart(2, "0")}:${endMinutes.toString().padStart(2, "0")}`;
+}
+
+export async function GET(request: NextRequest) {
   try {
+    const { searchParams } = new URL(request.url);
+    const date = searchParams.get("date");
+    const status = searchParams.get("status");
+
+    const where: Record<string, unknown> = {};
+
+    if (date) {
+      const dateObj = new Date(date);
+      where.date = dateObj;
+    }
+
+    if (status) {
+      where.status = status;
+    }
+
     const reservations = await prisma.reservation.findMany({
-      orderBy: { date: "asc" },
+      where,
+      include: {
+        customer: true,
+        table: true,
+        restaurant: {
+          select: {
+            name: true,
+          },
+        },
+      },
+      orderBy: [{ date: "asc" }, { timeStart: "asc" }],
     });
+
     return NextResponse.json(reservations);
   } catch (error) {
+    console.error("Erreur récupération réservations:", error);
     return NextResponse.json(
       { error: "Erreur lors de la récupération des réservations" },
       { status: 500 }
@@ -19,25 +78,125 @@ export async function GET() {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { name, email, phone, date, time, guests, notes } = body;
+    const {
+      firstName,
+      lastName,
+      email,
+      phone,
+      date,
+      time,
+      partySize,
+      occasion,
+      specialRequests,
+      allergies,
+    } = body;
 
-    if (!name || !email || !phone || !date || !time || !guests) {
+    if (!firstName || !lastName || !email || !date || !time || !partySize) {
       return NextResponse.json(
         { error: "Tous les champs obligatoires doivent être remplis" },
         { status: 400 }
       );
     }
 
+    // Récupérer le restaurant (premier par défaut)
+    const restaurant = await prisma.restaurant.findFirst();
+    if (!restaurant) {
+      return NextResponse.json(
+        { error: "Restaurant non configuré" },
+        { status: 500 }
+      );
+    }
+
+    // Trouver ou créer le client
+    let customer = await prisma.customer.findUnique({
+      where: { email },
+    });
+
+    if (customer) {
+      customer = await prisma.customer.update({
+        where: { email },
+        data: {
+          phone: phone || customer.phone,
+          firstName,
+          lastName,
+          allergies: allergies || customer.allergies,
+          visitCount: { increment: 1 },
+        },
+      });
+    } else {
+      customer = await prisma.customer.create({
+        data: {
+          email,
+          phone,
+          firstName,
+          lastName,
+          allergies,
+          visitCount: 1,
+        },
+      });
+    }
+
+    // Générer la référence et calculer l'heure de fin
+    const reference = await generateReference();
+    const bookingConfig = restaurant.bookingConfig as { mealDuration?: number };
+    const mealDuration = bookingConfig.mealDuration || 90;
+    const timeEnd = calculateEndTime(time, mealDuration);
+
+    // Trouver une table disponible
+    const availableTable = await prisma.table.findFirst({
+      where: {
+        restaurantId: restaurant.id,
+        isActive: true,
+        minCapacity: { lte: partySize },
+        maxCapacity: { gte: partySize },
+        reservations: {
+          none: {
+            date: new Date(date),
+            status: { notIn: ["CANCELLED"] },
+            OR: [
+              {
+                AND: [
+                  { timeStart: { lte: time } },
+                  { timeEnd: { gt: time } },
+                ],
+              },
+              {
+                AND: [
+                  { timeStart: { lt: timeEnd } },
+                  { timeEnd: { gte: timeEnd } },
+                ],
+              },
+              {
+                AND: [
+                  { timeStart: { gte: time } },
+                  { timeEnd: { lte: timeEnd } },
+                ],
+              },
+            ],
+          },
+        },
+      },
+      orderBy: { maxCapacity: "asc" },
+    });
+
+    // Créer la réservation
     const reservation = await prisma.reservation.create({
       data: {
-        name,
-        email,
-        phone,
+        reference,
+        restaurantId: restaurant.id,
+        tableId: availableTable?.id || null,
+        customerId: customer.id,
         date: new Date(date),
-        time,
-        guests: parseInt(guests),
-        notes: notes || null,
+        timeStart: time,
+        timeEnd,
+        partySize: parseInt(partySize),
         status: "PENDING",
+        occasion,
+        specialRequests,
+      },
+      include: {
+        customer: true,
+        table: true,
       },
     });
 
@@ -47,18 +206,20 @@ export async function POST(request: NextRequest) {
         await resend.emails.send({
           from: "Le Gourmet <noreply@legourmet.fr>",
           to: email,
-          subject: "Confirmation de votre réservation - Le Gourmet",
+          subject: `Confirmation de réservation ${reference} - Le Gourmet`,
           html: `
             <h1>Merci pour votre réservation !</h1>
-            <p>Bonjour ${name},</p>
-            <p>Votre réservation a bien été enregistrée avec les informations suivantes :</p>
-            <ul>
-              <li><strong>Date :</strong> ${new Date(date).toLocaleDateString("fr-FR", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}</li>
-              <li><strong>Heure :</strong> ${time}</li>
-              <li><strong>Nombre de convives :</strong> ${guests}</li>
-              ${notes ? `<li><strong>Notes :</strong> ${notes}</li>` : ""}
-            </ul>
-            <p>Nous avons hâte de vous accueillir !</p>
+            <p>Bonjour ${firstName},</p>
+            <p>Votre réservation <strong>${reference}</strong> a bien été enregistrée.</p>
+            <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
+              <p><strong>Date :</strong> ${new Date(date).toLocaleDateString("fr-FR", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}</p>
+              <p><strong>Heure :</strong> ${time}</p>
+              <p><strong>Nombre de convives :</strong> ${partySize}</p>
+              ${occasion ? `<p><strong>Occasion :</strong> ${occasion}</p>` : ""}
+              ${availableTable ? `<p><strong>Table :</strong> ${availableTable.name}</p>` : ""}
+            </div>
+            <p>Nous vous confirmerons votre réservation par email sous peu.</p>
+            <p>À très bientôt !</p>
             <p>L'équipe Le Gourmet</p>
           `,
         });
@@ -80,22 +241,64 @@ export async function POST(request: NextRequest) {
 export async function PATCH(request: NextRequest) {
   try {
     const body = await request.json();
-    const { id, status } = body;
+    const { id, status, tableId } = body;
 
-    if (!id || !status) {
-      return NextResponse.json(
-        { error: "ID et statut requis" },
-        { status: 400 }
-      );
+    if (!id) {
+      return NextResponse.json({ error: "ID requis" }, { status: 400 });
+    }
+
+    const updateData: Record<string, unknown> = {};
+
+    if (status) {
+      updateData.status = status;
+      if (status === "CONFIRMED") {
+        updateData.confirmedAt = new Date();
+      }
+    }
+
+    if (tableId !== undefined) {
+      updateData.tableId = tableId;
     }
 
     const reservation = await prisma.reservation.update({
       where: { id },
-      data: { status },
+      data: updateData,
+      include: {
+        customer: true,
+        table: true,
+      },
     });
+
+    // Envoyer email de confirmation si le statut est CONFIRMED
+    if (status === "CONFIRMED" && process.env.RESEND_API_KEY) {
+      try {
+        await resend.emails.send({
+          from: "Le Gourmet <noreply@legourmet.fr>",
+          to: reservation.customer.email,
+          subject: `Réservation ${reservation.reference} confirmée - Le Gourmet`,
+          html: `
+            <h1>Votre réservation est confirmée !</h1>
+            <p>Bonjour ${reservation.customer.firstName},</p>
+            <p>Nous avons le plaisir de vous confirmer votre réservation.</p>
+            <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
+              <p><strong>Référence :</strong> ${reservation.reference}</p>
+              <p><strong>Date :</strong> ${reservation.date.toLocaleDateString("fr-FR", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}</p>
+              <p><strong>Heure :</strong> ${reservation.timeStart}</p>
+              <p><strong>Nombre de convives :</strong> ${reservation.partySize}</p>
+              ${reservation.table ? `<p><strong>Table :</strong> ${reservation.table.name}</p>` : ""}
+            </div>
+            <p>Nous avons hâte de vous accueillir !</p>
+            <p>L'équipe Le Gourmet</p>
+          `,
+        });
+      } catch (emailError) {
+        console.error("Erreur envoi email:", emailError);
+      }
+    }
 
     return NextResponse.json(reservation);
   } catch (error) {
+    console.error("Erreur mise à jour réservation:", error);
     return NextResponse.json(
       { error: "Erreur lors de la mise à jour de la réservation" },
       { status: 500 }
@@ -109,10 +312,7 @@ export async function DELETE(request: NextRequest) {
     const id = searchParams.get("id");
 
     if (!id) {
-      return NextResponse.json(
-        { error: "ID requis" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "ID requis" }, { status: 400 });
     }
 
     await prisma.reservation.delete({
@@ -121,6 +321,7 @@ export async function DELETE(request: NextRequest) {
 
     return NextResponse.json({ success: true });
   } catch (error) {
+    console.error("Erreur suppression réservation:", error);
     return NextResponse.json(
       { error: "Erreur lors de la suppression de la réservation" },
       { status: 500 }

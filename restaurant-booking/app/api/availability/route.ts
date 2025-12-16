@@ -1,89 +1,211 @@
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 
-const DEFAULT_TIME_SLOTS = [
-  { time: "12:00", maxGuests: 20 },
-  { time: "12:30", maxGuests: 20 },
-  { time: "13:00", maxGuests: 20 },
-  { time: "13:30", maxGuests: 20 },
-  { time: "14:00", maxGuests: 20 },
-  { time: "19:00", maxGuests: 30 },
-  { time: "19:30", maxGuests: 30 },
-  { time: "20:00", maxGuests: 30 },
-  { time: "20:30", maxGuests: 30 },
-  { time: "21:00", maxGuests: 30 },
-  { time: "21:30", maxGuests: 20 },
-];
+interface OpeningHours {
+  [key: string]: {
+    lunch?: { start: string; end: string };
+    dinner?: { start: string; end: string };
+  } | null;
+}
+
+interface BookingConfig {
+  slotDuration: number;
+  mealDuration: number;
+  bufferTime: number;
+  maxPartySize: number;
+}
+
+// Générer les créneaux horaires pour une période donnée
+function generateTimeSlots(
+  start: string,
+  end: string,
+  slotDuration: number
+): string[] {
+  const slots: string[] = [];
+  const [startH, startM] = start.split(":").map(Number);
+  const [endH, endM] = end.split(":").map(Number);
+
+  let currentMinutes = startH * 60 + startM;
+  const endMinutes = endH * 60 + endM;
+
+  while (currentMinutes < endMinutes - slotDuration) {
+    const hours = Math.floor(currentMinutes / 60);
+    const minutes = currentMinutes % 60;
+    slots.push(
+      `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}`
+    );
+    currentMinutes += slotDuration;
+  }
+
+  return slots;
+}
+
+// Obtenir le nom du jour en anglais
+function getDayName(date: Date): string {
+  const days = [
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+  ];
+  return days[date.getDay()];
+}
 
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
     const dateStr = searchParams.get("date");
+    const partySizeStr = searchParams.get("partySize");
 
     if (!dateStr) {
-      return NextResponse.json(
-        { error: "Date requise" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Date requise" }, { status: 400 });
     }
 
     const date = new Date(dateStr);
-    const startOfDay = new Date(date.setHours(0, 0, 0, 0));
-    const endOfDay = new Date(date.setHours(23, 59, 59, 999));
+    const partySize = partySizeStr ? parseInt(partySizeStr) : 2;
+    const dayName = getDayName(date);
 
-    // Vérifier si la date est fermée
-    const closedDate = await prisma.closedDate.findFirst({
-      where: {
-        date: {
-          gte: startOfDay,
-          lte: endOfDay,
-        },
-      },
-    });
+    // Récupérer le restaurant
+    const restaurant = await prisma.restaurant.findFirst();
+    if (!restaurant) {
+      return NextResponse.json(
+        { error: "Restaurant non configuré" },
+        { status: 500 }
+      );
+    }
 
-    if (closedDate) {
+    const openingHours = restaurant.openingHours as OpeningHours;
+    const bookingConfig = restaurant.bookingConfig as BookingConfig;
+    const dayHours = openingHours[dayName];
+
+    // Restaurant fermé ce jour
+    if (!dayHours) {
       return NextResponse.json({
         available: false,
-        reason: closedDate.reason || "Restaurant fermé",
+        reason: "Le restaurant est fermé ce jour",
+        date: dateStr,
         slots: [],
       });
     }
 
-    // Récupérer les réservations pour cette date
-    const reservations = await prisma.reservation.findMany({
+    // Vérifier si la date est bloquée
+    const blockedSlot = await prisma.blockedSlot.findFirst({
       where: {
-        date: {
-          gte: startOfDay,
-          lte: endOfDay,
+        restaurantId: restaurant.id,
+        tableId: null,
+        date: date,
+      },
+    });
+
+    if (blockedSlot) {
+      return NextResponse.json({
+        available: false,
+        reason: blockedSlot.reason || "Restaurant fermé exceptionnellement",
+        date: dateStr,
+        slots: [],
+      });
+    }
+
+    // Générer tous les créneaux possibles
+    const allSlots: string[] = [];
+    if (dayHours.lunch) {
+      allSlots.push(
+        ...generateTimeSlots(
+          dayHours.lunch.start,
+          dayHours.lunch.end,
+          bookingConfig.slotDuration
+        )
+      );
+    }
+    if (dayHours.dinner) {
+      allSlots.push(
+        ...generateTimeSlots(
+          dayHours.dinner.start,
+          dayHours.dinner.end,
+          bookingConfig.slotDuration
+        )
+      );
+    }
+
+    // Récupérer les tables disponibles pour cette taille de groupe
+    const availableTables = await prisma.table.findMany({
+      where: {
+        restaurantId: restaurant.id,
+        isActive: true,
+        maxCapacity: { gte: partySize },
+      },
+      include: {
+        reservations: {
+          where: {
+            date: date,
+            status: { notIn: ["CANCELLED"] },
+          },
         },
-        status: {
-          not: "CANCELLED",
+        blockedSlots: {
+          where: {
+            date: date,
+          },
         },
       },
     });
 
     // Calculer la disponibilité pour chaque créneau
-    const timeSlots = await prisma.timeSlot.findMany({
-      where: { isActive: true },
-    });
+    const mealDuration = bookingConfig.mealDuration;
+    const bufferTime = bookingConfig.bufferTime;
 
-    const slots = (timeSlots.length > 0 ? timeSlots : DEFAULT_TIME_SLOTS).map((slot) => {
-      const slotReservations = reservations.filter((r) => r.time === slot.time);
-      const totalGuests = slotReservations.reduce((sum, r) => sum + r.guests, 0);
-      const remainingCapacity = slot.maxGuests - totalGuests;
+    const slots = allSlots.map((time) => {
+      const [hours, minutes] = time.split(":").map(Number);
+      const slotStart = hours * 60 + minutes;
+      const slotEnd = slotStart + mealDuration + bufferTime;
+
+      // Compter les tables disponibles pour ce créneau
+      let tablesAvailable = 0;
+
+      for (const table of availableTables) {
+        // Vérifier si la table est bloquée
+        const isBlocked = table.blockedSlots.some((blocked) => {
+          const [bStartH, bStartM] = blocked.timeStart.split(":").map(Number);
+          const [bEndH, bEndM] = blocked.timeEnd.split(":").map(Number);
+          const blockStart = bStartH * 60 + bStartM;
+          const blockEnd = bEndH * 60 + bEndM;
+          return slotStart < blockEnd && slotEnd > blockStart;
+        });
+
+        if (isBlocked) continue;
+
+        // Vérifier les réservations existantes
+        const hasConflict = table.reservations.some((res) => {
+          const [rStartH, rStartM] = res.timeStart.split(":").map(Number);
+          const [rEndH, rEndM] = res.timeEnd.split(":").map(Number);
+          const resStart = rStartH * 60 + rStartM;
+          const resEnd = rEndH * 60 + rEndM + bufferTime;
+          return slotStart < resEnd && slotEnd > resStart;
+        });
+
+        if (!hasConflict) {
+          tablesAvailable++;
+        }
+      }
 
       return {
-        time: slot.time,
-        maxGuests: slot.maxGuests,
-        currentGuests: totalGuests,
-        remainingCapacity: Math.max(0, remainingCapacity),
-        available: remainingCapacity > 0,
+        time,
+        available: tablesAvailable > 0,
+        tablesAvailable,
       };
     });
 
     return NextResponse.json({
       available: true,
       date: dateStr,
+      partySize,
+      restaurant: {
+        name: restaurant.name,
+        maxPartySize: bookingConfig.maxPartySize,
+      },
+      openingHours: dayHours,
       slots,
     });
   } catch (error) {
