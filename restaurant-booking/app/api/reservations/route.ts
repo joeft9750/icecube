@@ -1,7 +1,46 @@
 import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
 import prisma from "@/lib/prisma";
-import { resend } from "@/lib/resend";
-import { findAvailableTable, calculateEndTime } from "@/lib/availability";
+import {
+  findAvailableTable,
+  calculateEndTime,
+  getAvailability,
+} from "@/lib/availability";
+import {
+  sendCustomerConfirmationEmail,
+  sendRestaurantNotificationEmail,
+} from "@/lib/email";
+
+// Schéma de validation Zod
+const reservationSchema = z.object({
+  date: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, "Format de date invalide (YYYY-MM-DD)"),
+  time: z.string().regex(/^\d{2}:\d{2}$/, "Format d'heure invalide (HH:MM)"),
+  partySize: z
+    .number()
+    .int()
+    .min(1, "Au moins 1 personne")
+    .max(20, "Maximum 20 personnes"),
+  firstName: z
+    .string()
+    .min(2, "Le prénom doit contenir au moins 2 caractères")
+    .max(50),
+  lastName: z
+    .string()
+    .min(2, "Le nom doit contenir au moins 2 caractères")
+    .max(50),
+  email: z.string().email("Email invalide"),
+  phone: z
+    .string()
+    .regex(
+      /^(?:(?:\+|00)33|0)\s*[1-9](?:[\s.-]*\d{2}){4}$/,
+      "Numéro de téléphone français invalide"
+    ),
+  occasion: z.string().max(100).optional(),
+  specialRequests: z.string().max(500).optional(),
+  allergies: z.string().max(500).optional(),
+});
 
 // Générer une référence unique au format R2024-000001
 async function generateReference(): Promise<string> {
@@ -69,26 +108,32 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
+
+    // 1. Validation avec Zod
+    const validationResult = reservationSchema.safeParse(body);
+    if (!validationResult.success) {
+      const errors = validationResult.error.errors.map((e) => ({
+        field: e.path.join("."),
+        message: e.message,
+      }));
+      return NextResponse.json(
+        { error: "Données invalides", details: errors },
+        { status: 400 }
+      );
+    }
+
     const {
+      date,
+      time,
+      partySize,
       firstName,
       lastName,
       email,
       phone,
-      date,
-      time,
-      partySize,
       occasion,
       specialRequests,
       allergies,
-    } = body;
-
-    // Validation des champs obligatoires
-    if (!firstName || !lastName || !email || !date || !time || !partySize) {
-      return NextResponse.json(
-        { error: "Tous les champs obligatoires doivent être remplis" },
-        { status: 400 }
-      );
-    }
+    } = validationResult.data;
 
     // Récupérer le restaurant
     const restaurant = await prisma.restaurant.findFirst();
@@ -99,16 +144,64 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Trouver ou créer le client
+    // 2. Double vérification de disponibilité
+    const reservationDate = new Date(date + "T00:00:00");
+    const availability = await getAvailability(reservationDate, partySize);
+
+    // Vérifier si le créneau demandé est disponible
+    const requestedSlot = availability.slots.find((s) => s.time === time);
+    if (!requestedSlot || !requestedSlot.available) {
+      // 3. Retourner erreur 409 avec créneaux alternatifs
+      const alternativeSlots = availability.slots
+        .filter((s) => s.available)
+        .slice(0, 5)
+        .map((s) => s.time);
+
+      return NextResponse.json(
+        {
+          error: "Ce créneau n'est plus disponible",
+          code: "SLOT_UNAVAILABLE",
+          alternatives: alternativeSlots,
+          message:
+            alternativeSlots.length > 0
+              ? `Le créneau de ${time} n'est plus disponible. Créneaux alternatifs : ${alternativeSlots.join(", ")}`
+              : `Aucun créneau disponible pour ${partySize} personnes le ${date}`,
+        },
+        { status: 409 }
+      );
+    }
+
+    // 4. Trouver une table disponible
+    const tableId = await findAvailableTable(reservationDate, time, partySize);
+
+    if (!tableId) {
+      // Aucune table disponible (cas rare après la vérification ci-dessus)
+      const alternativeSlots = availability.slots
+        .filter((s) => s.available && s.time !== time)
+        .slice(0, 5)
+        .map((s) => s.time);
+
+      return NextResponse.json(
+        {
+          error: "Aucune table disponible pour ce créneau",
+          code: "NO_TABLE_AVAILABLE",
+          alternatives: alternativeSlots,
+        },
+        { status: 409 }
+      );
+    }
+
+    // 5. Créer ou récupérer le client (par email)
     let customer = await prisma.customer.findUnique({
       where: { email },
     });
 
     if (customer) {
+      // Mettre à jour les informations du client existant
       customer = await prisma.customer.update({
         where: { email },
         data: {
-          phone: phone || customer.phone,
+          phone: phone,
           firstName,
           lastName,
           allergies: allergies || customer.allergies,
@@ -116,31 +209,26 @@ export async function POST(request: NextRequest) {
         },
       });
     } else {
+      // Créer un nouveau client
       customer = await prisma.customer.create({
         data: {
           email,
           phone,
           firstName,
           lastName,
-          allergies,
+          allergies: allergies || null,
           visitCount: 1,
         },
       });
     }
 
-    // Générer la référence et calculer l'heure de fin
+    // 6. Générer une référence unique
     const reference = await generateReference();
-    const reservationDate = new Date(date + "T00:00:00");
+
+    // Calculer l'heure de fin
     const timeEnd = await calculateEndTime(time);
 
-    // Trouver une table disponible via la lib availability
-    const tableId = await findAvailableTable(
-      reservationDate,
-      time,
-      parseInt(partySize)
-    );
-
-    // Créer la réservation
+    // 7. Créer la réservation avec status CONFIRMED
     const reservation = await prisma.reservation.create({
       data: {
         reference,
@@ -150,46 +238,97 @@ export async function POST(request: NextRequest) {
         date: reservationDate,
         timeStart: time,
         timeEnd,
-        partySize: parseInt(partySize),
-        status: "PENDING",
+        partySize,
+        status: "CONFIRMED",
+        confirmedAt: new Date(),
         occasion: occasion || null,
         specialRequests: specialRequests || null,
       },
       include: {
         customer: true,
         table: true,
+        restaurant: {
+          select: {
+            name: true,
+            address: true,
+            phone: true,
+          },
+        },
       },
     });
 
-    // Envoyer email de confirmation
-    if (process.env.RESEND_API_KEY) {
-      try {
-        await resend.emails.send({
-          from: "Le Gourmet <noreply@legourmet.fr>",
-          to: email,
-          subject: `Confirmation de réservation ${reference} - Le Gourmet`,
-          html: `
-            <h1>Merci pour votre réservation !</h1>
-            <p>Bonjour ${firstName},</p>
-            <p>Votre réservation <strong>${reference}</strong> a bien été enregistrée.</p>
-            <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
-              <p><strong>Date :</strong> ${reservationDate.toLocaleDateString("fr-FR", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}</p>
-              <p><strong>Heure :</strong> ${time}</p>
-              <p><strong>Nombre de convives :</strong> ${partySize}</p>
-              ${occasion ? `<p><strong>Occasion :</strong> ${occasion}</p>` : ""}
-              ${reservation.table ? `<p><strong>Table :</strong> ${reservation.table.name}</p>` : ""}
-            </div>
-            <p>Nous vous confirmerons votre réservation par email sous peu.</p>
-            <p>À très bientôt !</p>
-            <p>L'équipe Le Gourmet</p>
-          `,
-        });
-      } catch (emailError) {
-        console.error("Erreur envoi email:", emailError);
-      }
+    // Données pour les emails
+    const emailData = {
+      reference: reservation.reference,
+      customerName: `${firstName} ${lastName}`,
+      email,
+      date: reservationDate,
+      time,
+      partySize,
+      tableName: reservation.table?.name,
+      occasion,
+      specialRequests,
+    };
+
+    // 8. Envoyer email de confirmation au client
+    const customerEmailResult = await sendCustomerConfirmationEmail(emailData);
+    if (!customerEmailResult.success) {
+      console.warn(
+        "Email confirmation client non envoyé:",
+        customerEmailResult.error
+      );
     }
 
-    return NextResponse.json(reservation, { status: 201 });
+    // 9. Envoyer email de notification au restaurant
+    const restaurantEmailResult =
+      await sendRestaurantNotificationEmail(emailData);
+    if (!restaurantEmailResult.success) {
+      console.warn(
+        "Email notification restaurant non envoyé:",
+        restaurantEmailResult.error
+      );
+    }
+
+    // 10. Retourner la réservation créée avec sa référence
+    return NextResponse.json(
+      {
+        success: true,
+        reservation: {
+          id: reservation.id,
+          reference: reservation.reference,
+          date: date,
+          time: reservation.timeStart,
+          timeEnd: reservation.timeEnd,
+          partySize: reservation.partySize,
+          status: reservation.status,
+          table: reservation.table
+            ? {
+                id: reservation.table.id,
+                name: reservation.table.name,
+                zone: reservation.table.zone,
+              }
+            : null,
+          customer: {
+            firstName: customer.firstName,
+            lastName: customer.lastName,
+            email: customer.email,
+          },
+          occasion: reservation.occasion,
+          specialRequests: reservation.specialRequests,
+          restaurant: {
+            name: reservation.restaurant.name,
+            address: reservation.restaurant.address,
+            phone: reservation.restaurant.phone,
+          },
+          confirmedAt: reservation.confirmedAt,
+        },
+        emailsSent: {
+          customer: customerEmailResult.success,
+          restaurant: restaurantEmailResult.success,
+        },
+      },
+      { status: 201 }
+    );
   } catch (error) {
     console.error("Erreur création réservation:", error);
     return NextResponse.json(
@@ -229,33 +368,6 @@ export async function PATCH(request: NextRequest) {
         table: true,
       },
     });
-
-    // Envoyer email de confirmation si le statut passe à CONFIRMED
-    if (status === "CONFIRMED" && process.env.RESEND_API_KEY) {
-      try {
-        await resend.emails.send({
-          from: "Le Gourmet <noreply@legourmet.fr>",
-          to: reservation.customer.email,
-          subject: `Réservation ${reservation.reference} confirmée - Le Gourmet`,
-          html: `
-            <h1>Votre réservation est confirmée !</h1>
-            <p>Bonjour ${reservation.customer.firstName},</p>
-            <p>Nous avons le plaisir de vous confirmer votre réservation.</p>
-            <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
-              <p><strong>Référence :</strong> ${reservation.reference}</p>
-              <p><strong>Date :</strong> ${reservation.date.toLocaleDateString("fr-FR", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}</p>
-              <p><strong>Heure :</strong> ${reservation.timeStart}</p>
-              <p><strong>Nombre de convives :</strong> ${reservation.partySize}</p>
-              ${reservation.table ? `<p><strong>Table :</strong> ${reservation.table.name}</p>` : ""}
-            </div>
-            <p>Nous avons hâte de vous accueillir !</p>
-            <p>L'équipe Le Gourmet</p>
-          `,
-        });
-      } catch (emailError) {
-        console.error("Erreur envoi email:", emailError);
-      }
-    }
 
     return NextResponse.json(reservation);
   } catch (error) {
