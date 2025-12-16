@@ -19,6 +19,16 @@ interface ReservationEmailData {
   specialRequests?: string | null;
 }
 
+interface ModificationEmailData extends ReservationEmailData {
+  oldDate?: Date;
+  oldTime?: string;
+  oldPartySize?: number;
+}
+
+interface CancellationEmailData extends ReservationEmailData {
+  reason?: string;
+}
+
 // Formater la date en français
 function formatDateFr(date: Date): string {
   return date.toLocaleDateString("fr-FR", {
@@ -254,7 +264,7 @@ export async function sendRestaurantNotificationEmail(
 
 // Envoyer email d'annulation
 export async function sendCancellationEmail(
-  data: ReservationEmailData
+  data: CancellationEmailData
 ): Promise<{ success: boolean; error?: string }> {
   if (!process.env.RESEND_API_KEY) {
     console.warn("RESEND_API_KEY non configuré - email non envoyé");
@@ -271,6 +281,261 @@ export async function sendCancellationEmail(
     return { success: true };
   } catch (error) {
     console.error("Erreur envoi email annulation:", error);
+    return { success: false, error: String(error) };
+  }
+}
+
+// Template email modification client
+function getModificationTemplate(data: ModificationEmailData): string {
+  const hasChanges =
+    data.oldDate || data.oldTime || data.oldPartySize;
+
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      ${emailStyles}
+    </head>
+    <body>
+      <div class="container">
+        <div class="header" style="background: linear-gradient(135deg, #0d6efd 0%, #0a58ca 100%);">
+          <h1>🍽️ ${RESTAURANT_NAME}</h1>
+        </div>
+        <div class="content">
+          <h2 style="text-align: center; color: #0d6efd;">✏️ Votre réservation a été modifiée</h2>
+
+          <p>Bonjour ${data.customerName},</p>
+
+          <p>Les modifications apportées à votre réservation ont bien été enregistrées.</p>
+
+          <div style="text-align: center; margin: 25px 0;">
+            <p style="margin: 0; color: #666;">Numéro de référence</p>
+            <p class="reference">${data.reference}</p>
+          </div>
+
+          ${hasChanges ? `
+          <div class="info-box" style="border-left-color: #6c757d; background: #f1f1f1;">
+            <h4 style="margin-top: 0; color: #6c757d;">Anciennes informations</h4>
+            ${data.oldDate ? `<p style="text-decoration: line-through; color: #6c757d;">📅 Date : ${formatDateFr(data.oldDate)}</p>` : ""}
+            ${data.oldTime ? `<p style="text-decoration: line-through; color: #6c757d;">🕐 Heure : ${data.oldTime}</p>` : ""}
+            ${data.oldPartySize ? `<p style="text-decoration: line-through; color: #6c757d;">👥 Nombre de convives : ${data.oldPartySize}</p>` : ""}
+          </div>
+          ` : ""}
+
+          <div class="info-box" style="border-left-color: #0d6efd;">
+            <h4 style="margin-top: 0; color: #0d6efd;">Nouvelles informations</h4>
+            <p><strong>📅 Date :</strong> ${formatDateFr(data.date)}</p>
+            <p><strong>🕐 Heure :</strong> ${data.time}</p>
+            <p><strong>👥 Nombre de convives :</strong> ${data.partySize} personne${data.partySize > 1 ? "s" : ""}</p>
+            ${data.tableName ? `<p><strong>🪑 Table :</strong> ${data.tableName}</p>` : ""}
+            ${data.occasion ? `<p><strong>🎉 Occasion :</strong> ${data.occasion}</p>` : ""}
+            ${data.specialRequests ? `<p><strong>📝 Demandes spéciales :</strong> ${data.specialRequests}</p>` : ""}
+          </div>
+
+          <div class="warning">
+            <strong>⚠️ Important :</strong> En cas d'empêchement, merci de nous prévenir au moins 24h à l'avance.
+          </div>
+
+          <p style="text-align: center;">
+            <a href="${process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000"}/reservation/confirmation/${data.reference}" class="button" style="background: #0d6efd;">
+              Voir ma réservation
+            </a>
+          </p>
+
+          <p>Nous avons hâte de vous accueillir !</p>
+
+          <p>Cordialement,<br>L'équipe ${RESTAURANT_NAME}</p>
+        </div>
+        <div class="footer">
+          <p><strong>${RESTAURANT_NAME}</strong></p>
+          <p>📍 ${RESTAURANT_ADDRESS}</p>
+          <p>📞 ${RESTAURANT_PHONE}</p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+}
+
+// Template notification restaurant modification
+function getRestaurantModificationNotificationTemplate(
+  data: ModificationEmailData
+): string {
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      ${emailStyles}
+    </head>
+    <body>
+      <div class="container">
+        <div class="header" style="background: linear-gradient(135deg, #0d6efd 0%, #0a58ca 100%);">
+          <h1>✏️ Réservation modifiée</h1>
+        </div>
+        <div class="content">
+          <h2 style="text-align: center; color: #0d6efd;">Référence : ${data.reference}</h2>
+
+          <div class="info-box">
+            <h3 style="margin-top: 0; color: #1a1a2e;">👤 Client</h3>
+            <p><strong>Nom :</strong> ${data.customerName}</p>
+            <p><strong>Email :</strong> <a href="mailto:${data.email}">${data.email}</a></p>
+          </div>
+
+          ${data.oldDate || data.oldTime || data.oldPartySize ? `
+          <div class="info-box" style="border-left-color: #dc3545;">
+            <h3 style="margin-top: 0; color: #dc3545;">❌ Avant modification</h3>
+            ${data.oldDate ? `<p><strong>📅 Date :</strong> ${formatDateFr(data.oldDate)}</p>` : ""}
+            ${data.oldTime ? `<p><strong>🕐 Heure :</strong> ${data.oldTime}</p>` : ""}
+            ${data.oldPartySize ? `<p><strong>👥 Convives :</strong> ${data.oldPartySize}</p>` : ""}
+          </div>
+          ` : ""}
+
+          <div class="info-box" style="border-left-color: #28a745;">
+            <h3 style="margin-top: 0; color: #28a745;">✓ Après modification</h3>
+            <p><strong>📅 Date :</strong> ${formatDateFr(data.date)}</p>
+            <p><strong>🕐 Heure :</strong> ${data.time}</p>
+            <p><strong>👥 Nombre de convives :</strong> ${data.partySize}</p>
+            ${data.tableName ? `<p><strong>🪑 Table :</strong> ${data.tableName}</p>` : ""}
+            ${data.occasion ? `<p><strong>Occasion :</strong> ${data.occasion}</p>` : ""}
+            ${data.specialRequests ? `<p><strong>Demandes spéciales :</strong> ${data.specialRequests}</p>` : ""}
+          </div>
+
+          <p style="text-align: center;">
+            <a href="${process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000"}/admin/reservations" class="button" style="background: #0d6efd;">
+              Voir dans l'administration
+            </a>
+          </p>
+        </div>
+        <div class="footer">
+          <p>Email automatique - Ne pas répondre</p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+}
+
+// Template notification restaurant annulation
+function getRestaurantCancellationNotificationTemplate(
+  data: CancellationEmailData
+): string {
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      ${emailStyles}
+    </head>
+    <body>
+      <div class="container">
+        <div class="header" style="background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);">
+          <h1>❌ Réservation annulée</h1>
+        </div>
+        <div class="content">
+          <h2 style="text-align: center; color: #dc3545;">Référence : ${data.reference}</h2>
+
+          <div class="info-box" style="border-left-color: #dc3545;">
+            <h3 style="margin-top: 0; color: #dc3545;">📋 Réservation annulée</h3>
+            <p><strong>📅 Date :</strong> ${formatDateFr(data.date)}</p>
+            <p><strong>🕐 Heure :</strong> ${data.time}</p>
+            <p><strong>👥 Nombre de convives :</strong> ${data.partySize}</p>
+          </div>
+
+          <div class="info-box">
+            <h3 style="margin-top: 0; color: #1a1a2e;">👤 Client</h3>
+            <p><strong>Nom :</strong> ${data.customerName}</p>
+            <p><strong>Email :</strong> <a href="mailto:${data.email}">${data.email}</a></p>
+          </div>
+
+          ${data.reason ? `
+          <div class="info-box" style="border-left-color: #ffc107; background: #fff3cd;">
+            <h3 style="margin-top: 0; color: #856404;">💬 Raison de l'annulation</h3>
+            <p>${data.reason}</p>
+          </div>
+          ` : ""}
+
+          <p style="text-align: center;">
+            <a href="${process.env.NEXT_PUBLIC_BASE_URL || "http://localhost:3000"}/admin/reservations" class="button" style="background: #dc3545;">
+              Voir dans l'administration
+            </a>
+          </p>
+        </div>
+        <div class="footer">
+          <p>Email automatique - Ne pas répondre</p>
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+}
+
+// Envoyer email de modification au client
+export async function sendModificationEmail(
+  data: ModificationEmailData
+): Promise<{ success: boolean; error?: string }> {
+  if (!process.env.RESEND_API_KEY) {
+    console.warn("RESEND_API_KEY non configuré - email non envoyé");
+    return { success: false, error: "Email non configuré" };
+  }
+
+  try {
+    await resend.emails.send({
+      from: FROM_EMAIL,
+      to: data.email,
+      subject: `Modification de réservation ${data.reference} - ${RESTAURANT_NAME}`,
+      html: getModificationTemplate(data),
+    });
+    return { success: true };
+  } catch (error) {
+    console.error("Erreur envoi email modification:", error);
+    return { success: false, error: String(error) };
+  }
+}
+
+// Envoyer notification modification au restaurant
+export async function sendRestaurantModificationNotification(
+  data: ModificationEmailData
+): Promise<{ success: boolean; error?: string }> {
+  if (!process.env.RESEND_API_KEY) {
+    console.warn("RESEND_API_KEY non configuré - notification non envoyée");
+    return { success: false, error: "Email non configuré" };
+  }
+
+  try {
+    await resend.emails.send({
+      from: FROM_EMAIL,
+      to: RESTAURANT_EMAIL,
+      subject: `✏️ Modification réservation ${data.reference} - ${data.customerName}`,
+      html: getRestaurantModificationNotificationTemplate(data),
+    });
+    return { success: true };
+  } catch (error) {
+    console.error("Erreur envoi notification restaurant:", error);
+    return { success: false, error: String(error) };
+  }
+}
+
+// Envoyer notification annulation au restaurant
+export async function sendRestaurantCancellationNotification(
+  data: CancellationEmailData
+): Promise<{ success: boolean; error?: string }> {
+  if (!process.env.RESEND_API_KEY) {
+    console.warn("RESEND_API_KEY non configuré - notification non envoyée");
+    return { success: false, error: "Email non configuré" };
+  }
+
+  try {
+    await resend.emails.send({
+      from: FROM_EMAIL,
+      to: RESTAURANT_EMAIL,
+      subject: `❌ Annulation réservation ${data.reference} - ${data.customerName}`,
+      html: getRestaurantCancellationNotificationTemplate(data),
+    });
+    return { success: true };
+  } catch (error) {
+    console.error("Erreur envoi notification restaurant:", error);
     return { success: false, error: String(error) };
   }
 }
