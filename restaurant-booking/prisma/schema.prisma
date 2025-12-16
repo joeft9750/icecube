@@ -1,0 +1,41 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Reservation {
+  id          String   @id @default(cuid())
+  name        String
+  email       String
+  phone       String
+  date        DateTime
+  time        String
+  guests      Int
+  notes       String?
+  status      ReservationStatus @default(PENDING)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+enum ReservationStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+}
+
+model TimeSlot {
+  id          String   @id @default(cuid())
+  time        String
+  maxGuests   Int      @default(20)
+  isActive    Boolean  @default(true)
+}
+
+model ClosedDate {
+  id          String   @id @default(cuid())
+  date        DateTime
+  reason      String?
+}
