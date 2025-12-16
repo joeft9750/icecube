@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { resend } from "@/lib/resend";
+import { findAvailableTable, calculateEndTime } from "@/lib/availability";
 
-// Générer une référence unique
+// Générer une référence unique au format R2024-000001
 async function generateReference(): Promise<string> {
   const year = new Date().getFullYear();
   const lastReservation = await prisma.reservation.findFirst({
@@ -25,26 +26,16 @@ async function generateReference(): Promise<string> {
   return `R${year}-${nextNumber.toString().padStart(6, "0")}`;
 }
 
-// Calculer l'heure de fin basée sur la durée du repas
-function calculateEndTime(startTime: string, durationMinutes: number): string {
-  const [hours, minutes] = startTime.split(":").map(Number);
-  const totalMinutes = hours * 60 + minutes + durationMinutes;
-  const endHours = Math.floor(totalMinutes / 60);
-  const endMinutes = totalMinutes % 60;
-  return `${endHours.toString().padStart(2, "0")}:${endMinutes.toString().padStart(2, "0")}`;
-}
-
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
-    const date = searchParams.get("date");
+    const dateStr = searchParams.get("date");
     const status = searchParams.get("status");
 
     const where: Record<string, unknown> = {};
 
-    if (date) {
-      const dateObj = new Date(date);
-      where.date = dateObj;
+    if (dateStr) {
+      where.date = new Date(dateStr + "T00:00:00");
     }
 
     if (status) {
@@ -91,6 +82,7 @@ export async function POST(request: NextRequest) {
       allergies,
     } = body;
 
+    // Validation des champs obligatoires
     if (!firstName || !lastName || !email || !date || !time || !partySize) {
       return NextResponse.json(
         { error: "Tous les champs obligatoires doivent être remplis" },
@@ -98,7 +90,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Récupérer le restaurant (premier par défaut)
+    // Récupérer le restaurant
     const restaurant = await prisma.restaurant.findFirst();
     if (!restaurant) {
       return NextResponse.json(
@@ -138,61 +130,30 @@ export async function POST(request: NextRequest) {
 
     // Générer la référence et calculer l'heure de fin
     const reference = await generateReference();
-    const bookingConfig = restaurant.bookingConfig as { mealDuration?: number };
-    const mealDuration = bookingConfig.mealDuration || 90;
-    const timeEnd = calculateEndTime(time, mealDuration);
+    const reservationDate = new Date(date + "T00:00:00");
+    const timeEnd = await calculateEndTime(time);
 
-    // Trouver une table disponible
-    const availableTable = await prisma.table.findFirst({
-      where: {
-        restaurantId: restaurant.id,
-        isActive: true,
-        minCapacity: { lte: partySize },
-        maxCapacity: { gte: partySize },
-        reservations: {
-          none: {
-            date: new Date(date),
-            status: { notIn: ["CANCELLED"] },
-            OR: [
-              {
-                AND: [
-                  { timeStart: { lte: time } },
-                  { timeEnd: { gt: time } },
-                ],
-              },
-              {
-                AND: [
-                  { timeStart: { lt: timeEnd } },
-                  { timeEnd: { gte: timeEnd } },
-                ],
-              },
-              {
-                AND: [
-                  { timeStart: { gte: time } },
-                  { timeEnd: { lte: timeEnd } },
-                ],
-              },
-            ],
-          },
-        },
-      },
-      orderBy: { maxCapacity: "asc" },
-    });
+    // Trouver une table disponible via la lib availability
+    const tableId = await findAvailableTable(
+      reservationDate,
+      time,
+      parseInt(partySize)
+    );
 
     // Créer la réservation
     const reservation = await prisma.reservation.create({
       data: {
         reference,
         restaurantId: restaurant.id,
-        tableId: availableTable?.id || null,
+        tableId,
         customerId: customer.id,
-        date: new Date(date),
+        date: reservationDate,
         timeStart: time,
         timeEnd,
         partySize: parseInt(partySize),
         status: "PENDING",
-        occasion,
-        specialRequests,
+        occasion: occasion || null,
+        specialRequests: specialRequests || null,
       },
       include: {
         customer: true,
@@ -212,11 +173,11 @@ export async function POST(request: NextRequest) {
             <p>Bonjour ${firstName},</p>
             <p>Votre réservation <strong>${reference}</strong> a bien été enregistrée.</p>
             <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
-              <p><strong>Date :</strong> ${new Date(date).toLocaleDateString("fr-FR", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}</p>
+              <p><strong>Date :</strong> ${reservationDate.toLocaleDateString("fr-FR", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}</p>
               <p><strong>Heure :</strong> ${time}</p>
               <p><strong>Nombre de convives :</strong> ${partySize}</p>
               ${occasion ? `<p><strong>Occasion :</strong> ${occasion}</p>` : ""}
-              ${availableTable ? `<p><strong>Table :</strong> ${availableTable.name}</p>` : ""}
+              ${reservation.table ? `<p><strong>Table :</strong> ${reservation.table.name}</p>` : ""}
             </div>
             <p>Nous vous confirmerons votre réservation par email sous peu.</p>
             <p>À très bientôt !</p>
@@ -269,7 +230,7 @@ export async function PATCH(request: NextRequest) {
       },
     });
 
-    // Envoyer email de confirmation si le statut est CONFIRMED
+    // Envoyer email de confirmation si le statut passe à CONFIRMED
     if (status === "CONFIRMED" && process.env.RESEND_API_KEY) {
       try {
         await resend.emails.send({
